@@ -3,7 +3,8 @@
 环境变量 API_PORT 指定监听端口（默认 8080）。
 路由：
   GET  /health   -> {"status": "ok"}
-  POST /assemble -> {"sequences": [...]} -> unique / ambiguous / no_solution
+  POST /assemble -> {"sequences": [...], "barcode_count": 1|2(可选)}
+                    -> unique / ambiguous / no_solution
 """
 from __future__ import annotations
 
@@ -46,7 +47,12 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8")) if raw else {}
             if not isinstance(data, dict) or "sequences" not in data:
                 raise ValidationError("请求体必须是包含 sequences 字段的 JSON 对象")
-            result = assemble(data["sequences"])
+            barcode_count = data.get("barcode_count", 1)
+            if barcode_count is None:
+                barcode_count = 1
+            if not isinstance(barcode_count, int) or isinstance(barcode_count, bool):
+                raise ValidationError("barcode_count 必须是整数 1 或 2")
+            result = assemble(data["sequences"], barcode_count=barcode_count)
             self._send_json(200, result)
         except ValidationError as exc:
             self._send_json(400, {"status": "invalid_input", "error": str(exc)})
