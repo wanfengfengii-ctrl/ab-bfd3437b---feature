@@ -8,9 +8,14 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
 from barcode import (  # noqa: E402
+    Edge,
+    MIN_GROUP_READS,
     canonical_circle,
     reverse_complement,
     ValidationError,
+    _build_degrees,
+    _components,
+    _enumerate_classes,
     assemble,
 )
 
@@ -237,6 +242,248 @@ class BruteForceCrossCheck(unittest.TestCase):
                 got = {w["canonical_barcode"] for w in r["witnesses"]}
                 self.assertEqual(len(got), 2)
                 self.assertTrue(got <= expected)
+
+
+def brute_dual_classes(reads: list[str], k: int) -> set[tuple[str, str]]:
+    """双株独立参照：枚举所有完整划分（读 0 固定归 A），组内枚举全部规范类，
+    收集"两组规范条码无序对"的集合。"""
+    n = len(reads)
+    edges = [Edge(s[:-1], s[1:], s, i) for i, s in enumerate(reads)]
+    pairs: set[tuple[str, str]] = set()
+    for bits in range(1 << (n - 1)):
+        mask = 1 | (bits << 1)
+        am = [i for i in range(n) if (mask >> i) & 1]
+        bm = [i for i in range(n) if not (mask >> i) & 1]
+        if not (MIN_GROUP_READS <= len(am) <= n - MIN_GROUP_READS):
+            continue
+        ga = [edges[i] for i in am]
+        gb = [edges[i] for i in bm]
+        ia, oa, va = _build_degrees(ga)
+        ib, ob, vb = _build_degrees(gb)
+        if any(ia.get(v, 0) != oa.get(v, 0) for v in va):
+            continue
+        if any(ib.get(v, 0) != ob.get(v, 0) for v in vb):
+            continue
+        if len(_components(ga)) > 1 or len(_components(gb)) > 1:
+            continue
+        ca = {c for c, _, _ in _enumerate_classes(ga, va[0], k, limit=99)}
+        cb = {c for c, _, _ in _enumerate_classes(gb, vb[0], k, limit=99)}
+        for a in ca:
+            for b in cb:
+                pairs.add(tuple(sorted((a, b))))
+    return pairs
+
+
+def check_dual_witness(test: unittest.TestCase, result: dict,
+                       reads: list[str], k: int) -> None:
+    """双株见证一致性：每组闭环、每条读数恰好一次、归属与证据自洽。"""
+    n = len(reads)
+    if "status" in result:
+        witnesses = [result] if result["status"] == "unique" else result["witnesses"]
+    else:
+        witnesses = [result]  # 单个 ambiguous 见证
+    for wit in witnesses:
+        groups = wit["groups"]
+        test.assertEqual(len(groups), 2)
+        all_orders: list[int] = []
+        for rank, g in enumerate(groups, start=1):
+            m = len(g["order"])
+            test.assertGreaterEqual(m, MIN_GROUP_READS)
+            all_orders.extend(g["order"])
+            test.assertEqual(len(g["evidence"]), m)
+            length = k + 1
+            reps = (m + length) // m + 1
+            doubled = g["barcode"] * reps
+            for pos, ev in enumerate(g["evidence"]):
+                test.assertEqual(ev["position"], pos)
+                a = reads[ev["prev"] - 1]
+                b = reads[ev["next"] - 1]
+                test.assertEqual(ev["prev"], g["order"][pos])
+                test.assertEqual(ev["next"], g["order"][(pos + 1) % m])
+                test.assertEqual(a[1:], b[:-1])
+                test.assertEqual(ev["overlap"], a[1:])
+                test.assertEqual(ev["overlap_length"], k)
+                test.assertEqual(doubled[pos:pos + length],
+                                 reads[g["order"][pos] - 1])
+            test.assertEqual(canonical_circle(g["barcode"]),
+                             g["canonical_barcode"])
+            for one in g["order"]:
+                test.assertEqual(wit["assignment"][one - 1], rank)
+        test.assertEqual(sorted(all_orders), list(range(1, n + 1)))
+        test.assertEqual(wit["canonical_barcodes"],
+                         [g["canonical_barcode"] for g in groups])
+        test.assertEqual(sorted(wit["canonical_barcodes"]),
+                         sorted(wit["canonical_barcodes"]))
+
+
+class DualValidationTests(unittest.TestCase):
+    def test_count_bounds(self):
+        with self.assertRaises(ValidationError):
+            assemble(["AAA"] * 5, 2)  # 少于 6
+        with self.assertRaises(ValidationError):
+            assemble(["AAA"] * 19, 2)  # 双株上限 18
+
+    def test_bad_barcode_count(self):
+        with self.assertRaises(ValidationError):
+            assemble(["AAA"] * 6, 0)
+        with self.assertRaises(ValidationError):
+            assemble(["AAA"] * 6, 3)
+        with self.assertRaises(ValidationError):
+            assemble(["AAA"] * 6, "2")  # type: ignore[arg-type]
+
+    def test_explicit_one_keeps_single_behavior(self):
+        reads = ["AAT", "ATC", "TCG", "CGC", "GCA", "CAA"]
+        r = assemble(list(reads), 1)
+        self.assertEqual(r["status"], "unique")
+        self.assertEqual(r["canonical_barcode"], "AATCGC")
+
+
+class DualUniqueTests(unittest.TestCase):
+    # 两条 4 环，k-mer 字母表互不相交，划分唯一。
+    R1 = ["AAT", "ATC", "TCA", "CAA"]   # 环 AATC
+    R2 = ["GTT", "TTG", "TGG", "GGT"]   # 环 GT TG.. 规范代表 AACC
+
+    def test_unique_partition(self):
+        reads = self.R1 + self.R2
+        r = assemble(list(reads), 2)
+        self.assertEqual(r["status"], "unique")
+        self.assertEqual(r["canonical_barcodes"], ["AACC", "AATC"])
+        self.assertEqual(r["read_count"], 8)
+        self.assertEqual(r["barcode_count"], 2)
+        check_dual_witness(self, r, reads, 2)
+
+    def test_shuffle_and_group_swap_equivalent(self):
+        reads = self.R1 + self.R2
+        rng = random.Random(20261002)
+        pairs = set()
+        for _ in range(30):
+            sh = reads[:]
+            rng.shuffle(sh)
+            r = assemble(sh, 2)
+            self.assertEqual(r["status"], "unique", sh)
+            self.assertEqual(r["canonical_barcodes"], ["AACC", "AATC"])
+            pairs.add(tuple(r["canonical_barcodes"]))
+            check_dual_witness(self, r, sh, 2)
+        self.assertEqual(len(pairs), 1)  # 组交换不制造差异
+
+    def test_assignment_covers_every_read_once(self):
+        r = assemble(self.R1 + self.R2, 2)
+        self.assertEqual(sorted(r["assignment"]), [1, 1, 1, 1, 2, 2, 2, 2])
+
+
+class DualIdenticalBarcodeTests(unittest.TestCase):
+    """两条条码序列相同、但证据足以分成两份时，必须给唯一双株结论。"""
+
+    READS = ["AAC", "ACA", "CAA"] * 2  # 环 AAC 的两个实例
+
+    def test_unique_even_though_barcodes_identical(self):
+        r = assemble(list(self.READS), 2)
+        self.assertEqual(r["status"], "unique")
+        self.assertEqual(r["canonical_barcodes"], ["AAC", "AAC"])
+        self.assertEqual(r["assignment"], [1, 1, 1, 2, 2, 2])
+        check_dual_witness(self, r, self.READS, 2)
+
+    def test_shuffled_identical_still_unique(self):
+        rng = random.Random(11)
+        for _ in range(20):
+            sh = self.READS[:]
+            rng.shuffle(sh)
+            r = assemble(sh, 2)
+            self.assertEqual(r["status"], "unique", sh)
+            self.assertEqual(r["canonical_barcodes"], ["AAC", "AAC"])
+            check_dual_witness(self, r, sh, 2)
+
+
+class DualAmbiguousTests(unittest.TestCase):
+    # 3xAAA 自环 + 3xCCC 自环 + A 环(AATC 结构边: AAC,ACC,CCA,CAA)。
+    # 跨环共享顶点 AA/CC 时存在两份不同完整划分：
+    #   {'AAA','AACCCCC'} 与 {'AAAAACC','CCC'}
+    READS = ["AAA", "AAA", "AAA", "CCC", "CCC", "CCC",
+             "AAC", "ACC", "CCA", "CAA"]
+
+    def test_two_distinct_complete_partitions(self):
+        r = assemble(list(self.READS), 2)
+        self.assertEqual(r["status"], "ambiguous")
+        self.assertEqual(len(r["witnesses"]), 2)
+        pairs = {tuple(w["canonical_barcodes"]) for w in r["witnesses"]}
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(
+            pairs,
+            {("AAA", "AACCCCC"), ("AAAAACC", "CCC")},
+        )
+        for w in r["witnesses"]:
+            check_dual_witness(self, w, self.READS, 2)
+
+    def test_matches_brute_force(self):
+        expected = brute_dual_classes(self.READS, 2)
+        self.assertEqual(len(expected), 2)
+        r = assemble(list(self.READS), 2)
+        got = {tuple(w["canonical_barcodes"]) for w in r["witnesses"]}
+        self.assertTrue(got <= expected)
+
+
+class DualNoSolutionTests(unittest.TestCase):
+    def test_globally_imbalanced_unsplittable(self):
+        reads = ["AAA", "AAA", "AAA", "AAC", "CCC", "GGG"]
+        r = assemble(list(reads), 2)
+        self.assertEqual(r["status"], "no_solution")
+        codes = {x["code"] for x in r["reasons"]}
+        self.assertEqual(codes, {"no_dual_partition"})
+        reason = r["reasons"][0]
+        self.assertIn("global_degree_imbalance", reason)
+        self.assertGreaterEqual(reason["partitions_examined"], 1)
+
+    def test_two_self_loops_plus_isolated_read_splits_fine_else_not(self):
+        # 6 条全是互不相同 k-mer 的自环 -> 每组 3 条可拆，应有解
+        reads = ["AAA", "AAA", "AAA", "CCC", "CCC", "CCC"]
+        r = assemble(list(reads), 2)
+        self.assertEqual(r["status"], "unique")
+        self.assertEqual(r["canonical_barcodes"], ["AAA", "CCC"])
+        # 换成 4 个不同自环，无法凑出每组 >=3 的两个平衡组
+        reads2 = ["AAA", "AAA", "CCC", "CCC", "GGG", "GGG"]
+        r2 = assemble(list(reads2), 2)
+        self.assertEqual(r2["status"], "no_solution")
+        self.assertEqual(r2["reasons"][0]["code"], "no_dual_partition")
+
+
+class DualBruteForceCrossCheck(unittest.TestCase):
+    """随机小实例：双株裁决必须与独立全划分暴力参照一致。"""
+
+    def test_random_instances(self):
+        rng = random.Random(20261002)
+        for _ in range(80):
+            n = rng.randint(6, 10)
+            ncirc = rng.choice([1, 2, 2, 3])
+            base = [n // ncirc] * ncirc
+            for i in range(n - sum(base)):
+                base[i] += 1
+            reads: list[str] = []
+            for cnt in base:
+                length = rng.randint(3, 5)
+                circle = "".join(rng.choice("ACGT") for _ in range(length))
+                pool = reads_of(circle, 3)
+                if cnt > len(pool):
+                    chosen = [rng.choice(pool) for _ in range(cnt)]
+                else:
+                    chosen = rng.sample(pool, cnt)
+                reads.extend(chosen)
+            rng.shuffle(reads)
+            expected = brute_dual_classes(reads, 2)
+            r = assemble(list(reads), 2)
+            if not expected:
+                self.assertEqual(r["status"], "no_solution", reads)
+            elif len(expected) == 1:
+                self.assertEqual(r["status"], "unique", reads)
+                self.assertEqual(tuple(r["canonical_barcodes"]),
+                                 next(iter(expected)), reads)
+                check_dual_witness(self, r, reads, 2)
+            else:
+                self.assertEqual(r["status"], "ambiguous", reads)
+                got = {tuple(w["canonical_barcodes"]) for w in r["witnesses"]}
+                self.assertEqual(len(got), 2)
+                self.assertTrue(got <= expected)
+                for w in r["witnesses"]:
+                    check_dual_witness(self, w, reads, 2)
 
 
 if __name__ == "__main__":
